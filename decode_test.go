@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package epub
+
+import (
+	"archive/zip"
+	"bytes"
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestDecode_MinimalValid(t *testing.T) {
+	epubData := makeMinimalEPUB(t, minimalEPUBConfig{mimetypeFirst: true})
+	doc, err := Decode(bytes.NewReader(epubData), int64(len(epubData)))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if doc.Title != "Test Book" {
+		t.Fatalf("unexpected title: %s", doc.Title)
+	}
+	if doc.Direction != "rtl" {
+		t.Fatalf("unexpected direction: %s", doc.Direction)
+	}
+	if len(doc.Pages) != 1 {
+		t.Fatalf("unexpected pages len: %d", len(doc.Pages))
+	}
+	if len(doc.Assets) != 2 {
+		t.Fatalf("unexpected assets len: %d", len(doc.Assets))
+	}
+}
+
+func TestDecode_PrePaginatedViewport(t *testing.T) {
+	epubData := makeMinimalEPUB(t, minimalEPUBConfig{mimetypeFirst: true, prePaginated: true, withViewport: true})
+	doc, err := Decode(bytes.NewReader(epubData), int64(len(epubData)))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if !doc.IsPrePaginated() {
+		t.Fatal("expected pre-paginated layout")
+	}
+	if doc.Pages[0].Width != 1200 || doc.Pages[0].Height != 1600 {
+		t.Fatalf("unexpected viewport: %dx%d", doc.Pages[0].Width, doc.Pages[0].Height)
+	}
+}
+
+func TestDecode_MimetypeNotFirst(t *testing.T) {
+	epubData := makeMinimalEPUB(t, minimalEPUBConfig{mimetypeFirst: false})
+	_, err := Decode(bytes.NewReader(epubData), int64(len(epubData)))
+	if !errors.Is(err, ErrMimeTypeNotFirst) {
+		t.Fatalf("expected ErrMimeTypeNotFirst, got: %v", err)
+	}
+}
+
+func TestDecode_MimetypeCompressed(t *testing.T) {
+	epubData := makeMinimalEPUB(t, minimalEPUBConfig{mimetypeFirst: true, mimetypeDeflate: true})
+	_, err := Decode(bytes.NewReader(epubData), int64(len(epubData)))
+	if !errors.Is(err, ErrInvalidMimeType) {
+		t.Fatalf("expected ErrInvalidMimeType, got: %v", err)
+	}
+}
+
+func TestDecode_EBPAJImageNamingViolation(t *testing.T) {
+	epubData := makeMinimalEPUB(t, minimalEPUBConfig{mimetypeFirst: true, imageHref: "item/image/foo.jpg"})
+	_, err := Decode(bytes.NewReader(epubData), int64(len(epubData)), WithCompliance(LevelEBPAJ))
+	if err == nil {
+		t.Fatal("expected compliance error")
+	}
+	var de *DecodeError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected DecodeError, got: %T", err)
+	}
+	if de.Rule != "image-naming" {
+		t.Fatalf("unexpected rule: %s", de.Rule)
+	}
+}
+
+type minimalEPUBConfig struct {
+	mimetypeFirst   bool
+	mimetypeDeflate bool
+	prePaginated    bool
+	withViewport    bool
+	imageHref       string
+}
+
+func makeMinimalEPUB(t *testing.T, cfg minimalEPUBConfig) []byte {
+	t.Helper()
+	if cfg.imageHref == "" {
+		cfg.imageHref = "item/image/p-001.jpg"
+	}
+	manifestImageHref := strings.TrimPrefix(cfg.imageHref, "item/")
+	if !cfg.mimetypeFirst && cfg.mimetypeDeflate {
+		// allowed; this helper intentionally supports both toggles
+	}
+
+	layout := "reflowable"
+	if cfg.prePaginated {
+		layout = "pre-paginated"
+	}
+
+	xhtml := `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <title>p1</title>`
+	if cfg.withViewport {
+		xhtml += `
+  <meta name="viewport" content="width=1200,height=1600"/>`
+	}
+	xhtml += `
+</head>
+<body><p>hello</p></body>
+</html>`
+
+	opf := `<?xml version="1.0" encoding="UTF-8"?>
+<package version="3.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Test Book</dc:title>
+    <meta property="rendition:layout">` + layout + `</meta>
+  </metadata>
+  <manifest>
+		<item id="xhtml-1" href="xhtml/p-001.xhtml" media-type="application/xhtml+xml"/>
+		<item id="p-001" href="` + manifestImageHref + `" media-type="image/jpeg"/>
+  </manifest>
+  <spine page-progression-direction="rtl">
+    <itemref idref="xhtml-1" properties="page-spread-right"/>
+  </spine>
+</package>`
+
+	container := `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="item/standard.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	writeMimetype := func() {
+		method := zip.Store
+		if cfg.mimetypeDeflate {
+			method = zip.Deflate
+		}
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: "mimetype", Method: uint16(method)})
+		if err != nil {
+			t.Fatalf("create mimetype: %v", err)
+		}
+		if _, err := w.Write([]byte(mimeTypeValue)); err != nil {
+			t.Fatalf("write mimetype: %v", err)
+		}
+	}
+
+	writeOtherFirst := func() {
+		w, err := zw.Create("META-INF/container.xml")
+		if err != nil {
+			t.Fatalf("create container: %v", err)
+		}
+		if _, err := w.Write([]byte(container)); err != nil {
+			t.Fatalf("write container: %v", err)
+		}
+	}
+
+	if cfg.mimetypeFirst {
+		writeMimetype()
+	} else {
+		writeOtherFirst()
+		writeMimetype()
+	}
+
+	if cfg.mimetypeFirst {
+		writeOtherFirst()
+	}
+
+	if w, err := zw.Create("item/standard.opf"); err != nil {
+		t.Fatalf("create opf: %v", err)
+	} else if _, err := w.Write([]byte(opf)); err != nil {
+		t.Fatalf("write opf: %v", err)
+	}
+	if w, err := zw.Create("item/xhtml/p-001.xhtml"); err != nil {
+		t.Fatalf("create xhtml: %v", err)
+	} else if _, err := w.Write([]byte(xhtml)); err != nil {
+		t.Fatalf("write xhtml: %v", err)
+	}
+	if w, err := zw.Create(cfg.imageHref); err != nil {
+		t.Fatalf("create image: %v", err)
+	} else if _, err := w.Write([]byte("fake-jpeg")); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+	return buf.Bytes()
+}
